@@ -23,6 +23,9 @@ Issues it auto-fixes:
        it sees the conflict still present.
   6. AndroidManifest.xml missing package attribute (very old projects).
      → Add `package="..."` based on the namespace from build.gradle.
+  7. Kotlin/Java JVM target validation fails on modern AGP/Kotlin defaults.
+     → Set `kotlin.jvm.target.validation.mode=warning` in gradle.properties
+      for Kotlin + AGP 8+ projects unless already defined.
 
 The script writes a JSON report to stdout (and to $GITHUB_OUTPUT for
 the workflow). It NEVER fails the build — fixes are best-effort, and
@@ -241,6 +244,57 @@ def heal_missing_local_properties(root: Path, android_sdk: str, fixes: list[dict
     })
 
 
+def heal_kotlin_jvm_target_validation(root: Path, agp_version: str | None, fixes: list[dict]) -> None:
+    """Avoid hard failures from Kotlin/Java target mismatch validation.
+
+    Newer Kotlin/AGP combinations can fail with:
+      "Inconsistent JVM-target compatibility ... (1.8) and ... (17)"
+    when Java compile defaults differ from Kotlin defaults. We keep the build
+    moving by downgrading this specific check to a warning via gradle.properties.
+    """
+    if not agp_version:
+        return
+    try:
+        agp_major = int(str(agp_version).split(".", 1)[0])
+    except Exception:
+        return
+    if agp_major < 8:
+        return
+
+    gradle_files = [
+        root / "build.gradle.kts",
+        root / "build.gradle",
+        root / "app" / "build.gradle.kts",
+        root / "app" / "build.gradle",
+    ]
+    has_kotlin = False
+    for gf in gradle_files:
+        if not gf.exists():
+            continue
+        content = read_file(gf)
+        if "org.jetbrains.kotlin" in content or "kotlin(" in content:
+            has_kotlin = True
+            break
+    if not has_kotlin:
+        return
+
+    props = root / "gradle.properties"
+    content = read_file(props) if props.exists() else ""
+    if re.search(r"(?im)^\s*kotlin\.jvm\.target\.validation\.mode\s*=", content):
+        return
+
+    line = "kotlin.jvm.target.validation.mode=warning"
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += f"{line}\n"
+    props.write_text(content)
+    fixes.append({
+        "name": "set_kotlin_jvm_target_validation_mode",
+        "action": f"added `{line}` to {props.relative_to(root) if props.is_relative_to(root) else props}",
+        "reason": "Prevents hard failure when Gradle detects Kotlin/Java JVM target mismatch (for example 17 vs 1.8).",
+    })
+
+
 def detect_duplicate_classes(root: Path, warnings: list[dict]) -> None:
     """Scan all .kt / .java files for top-level class declarations, warn if
     the same fully-qualified class name appears in 2+ files (Kotlin refuses
@@ -406,13 +460,16 @@ def main() -> int:
     # 3. Missing local.properties
     heal_missing_local_properties(root, args.android_sdk, fixes)
 
-    # 4. AndroidManifest package attribute (for old projects)
+    # 4. Kotlin JVM target validation mismatch (Kotlin + AGP 8+)
+    heal_kotlin_jvm_target_validation(root, agp_version, fixes)
+
+    # 5. AndroidManifest package attribute (for old projects)
     heal_android_manifest_package(root, fixes, warnings)
 
-    # 5. Detect duplicate top-level classes (warn-only, do NOT auto-delete)
+    # 6. Detect duplicate top-level classes (warn-only, do NOT auto-delete)
     detect_duplicate_classes(root, warnings)
 
-    # 6. Detect RepositoriesMode conflict (warn-only)
+    # 7. Detect RepositoriesMode conflict (warn-only)
     detect_repositories_mode_conflict(root, warnings)
 
     report = {
